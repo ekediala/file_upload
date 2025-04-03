@@ -12,15 +12,17 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
 
 const (
-	serviceUrl = "http://localhost:8080"
+	serviceUrl = "http://localhost:8000"
 	chunkSize  = 512 * 1024
 	bufferSize = 64 * 1024
 	Port       = 8888
+	Mib        = 1_000_000
 )
 
 var signals = []os.Signal{
@@ -64,7 +66,13 @@ func main() {
 }
 
 func FileDownloadHandler(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	fileName := r.PathValue("fileName")
+	if strings.Contains(fileName, "..") {
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+
 	file, err := os.OpenFile(fileName, os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -80,9 +88,10 @@ func FileDownloadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	fileSize := stat.Size()
-
 	client := http.DefaultClient
 	url := fmt.Sprintf("%s/download/%s", serviceUrl, fileName)
+
+	// make head request to get the file size. this helps with resumability
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodHead, url, nil)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -131,15 +140,13 @@ func FileDownloadHandler(w http.ResponseWriter, r *http.Request) {
 
 		statusCode, err := downloadChunk(r.Context(), client, writer, url, start, end)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		if statusCode != http.StatusPartialContent {
-			w.Write([]byte("Download complete"))
+			http.Error(w, err.Error(), statusCode)
 			return
 		}
 	}
+
+	fmt.Printf("Took %fs to download %dmib\n", time.Since(start).Seconds(), totalSize/Mib)
+	w.Write([]byte("Download complete"))
 }
 
 func downloadChunk(ctx context.Context, client *http.Client, w io.Writer, url string, start, end int64) (int, error) {
@@ -158,15 +165,15 @@ func downloadChunk(ctx context.Context, client *http.Client, w io.Writer, url st
 	defer res.Body.Close()
 
 	var reader io.Reader = res.Body
-	
+
 	if res.Header.Get("Content-Encoding") == "gzip" {
-        gzipReader, err := gzip.NewReader(res.Body)
-        if err != nil {
-            return http.StatusInternalServerError, err
-        }
-        defer gzipReader.Close()
-        reader = gzipReader
-    }
+		gzipReader, err := gzip.NewReader(res.Body)
+		if err != nil {
+			return http.StatusInternalServerError, err
+		}
+		defer gzipReader.Close()
+		reader = gzipReader
+	}
 
 	if res.StatusCode >= http.StatusBadRequest {
 		var b bytes.Buffer
@@ -182,6 +189,8 @@ func downloadChunk(ctx context.Context, client *http.Client, w io.Writer, url st
 	if err != nil {
 		return http.StatusInternalServerError, err
 	}
+
+	fmt.Printf("Downloaded %s\n", res.Header.Get("Content-Range"))
 
 	return res.StatusCode, nil
 }
