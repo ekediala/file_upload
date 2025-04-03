@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -148,6 +149,7 @@ func downloadChunk(ctx context.Context, client *http.Client, w io.Writer, url st
 	}
 
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+	req.Header.Set("Accept-Encoding", "gzip")
 
 	res, err := client.Do(req)
 	if err != nil {
@@ -155,9 +157,20 @@ func downloadChunk(ctx context.Context, client *http.Client, w io.Writer, url st
 	}
 	defer res.Body.Close()
 
+	var reader io.Reader = res.Body
+	
+	if res.Header.Get("Content-Encoding") == "gzip" {
+        gzipReader, err := gzip.NewReader(res.Body)
+        if err != nil {
+            return http.StatusInternalServerError, err
+        }
+        defer gzipReader.Close()
+        reader = gzipReader
+    }
+
 	if res.StatusCode >= http.StatusBadRequest {
 		var b bytes.Buffer
-		_, err := io.Copy(&b, res.Body)
+		_, err := io.Copy(&b, reader)
 		if err != nil {
 			return http.StatusInternalServerError, err
 		}
@@ -165,7 +178,7 @@ func downloadChunk(ctx context.Context, client *http.Client, w io.Writer, url st
 		return res.StatusCode, fmt.Errorf(b.String())
 	}
 
-	_, err = io.Copy(w, res.Body)
+	_, err = io.Copy(w, reader)
 	if err != nil {
 		return http.StatusInternalServerError, err
 	}
