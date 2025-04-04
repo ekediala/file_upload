@@ -18,8 +18,9 @@ import (
 )
 
 const (
-	Port              = 8000
-	ContentFolderName = "files"
+	Port               = 8000
+	ContentFolderName  = "files"
+	MinCompressionSize = 8 * 1024 // 8kb
 )
 
 var signals = []os.Signal{
@@ -33,6 +34,9 @@ func main() {
 	defer cancel()
 
 	mux := http.NewServeMux()
+
+	// we have one handler handle both the HEAD and GET requests
+	// we want to maintain the coupling between both requests
 	mux.HandleFunc("HEAD /download/{fileName}", Handler)
 	mux.HandleFunc("GET /download/{fileName}", Handler)
 
@@ -43,6 +47,10 @@ func main() {
 
 	fmt.Println("Started server on port:", Port)
 
+	// start the server in a goroutine. We could just start the server on the main
+	// thread but that introduces problems for our clean up process. If we listen to
+	// the clean up in a goroutine we won't be able to wait for the shutdown process
+	// to finish before exiting main.
 	go func() {
 		err := server.ListenAndServe()
 		if errors.Is(err, http.ErrServerClosed) {
@@ -65,6 +73,7 @@ func main() {
 
 func Handler(w http.ResponseWriter, r *http.Request) {
 	fileName := r.PathValue("fileName")
+	// ensure this request is not trying to do something fishy
 	if strings.Contains(fileName, "..") {
 		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 		return
@@ -89,6 +98,11 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// if it is a head request, we send back the file size. The client will use
+	// that data for resumability i.e to tell us if parts of the file have already
+	// been downloaded and therefore where to resume from. The client can also use
+	// the size to decide how to chunk the data to achieve a balance between number
+	// of http calls and download speed per chunk.
 	if r.Method == http.MethodHead {
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", stat.Size()))
 		return
@@ -119,21 +133,39 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	contentType := getContentType(fileName, file)
 	w.Header().Set("Content-Type", contentType)
 
-	// Check if we should compress this chunk
-	acceptsGzip := strings.Contains(r.Header.Get("Accept-Encoding"), "gzip")
-	shouldCompress := acceptsGzip &&
-		isCompressibleType(contentType) &&
-		chunkSize >= 8*1024 // Only compress chunks >= 8KB
-
-	// Set up the chunk reader
+	// Set the file offset to the provided start point.
+	// We do not want to read from the start of the file.
+	// We want to "resume" from where they stopped
 	_, err = file.Seek(start, io.SeekStart)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Create a limited reader for just this chunk
-	chunkReader := io.LimitReader(file, chunkSize)
+	// Create a limited reader for just this chunk.
+	// Why? This is exactly why it exists. Alternatively, we could create a
+	// buffer to minimize syscalls but it won't be necessary here.
+	// We use io.copy to stream the response to the client. Given we also don't
+	// know what is contained in the file, we will have to read the whole chunk size
+	// into memory:
+	//
+	// data := make([]byte, chunkSize)
+	// reader := bufio.NewReader(file)
+	// n, _ := reader.Read(data)
+	//
+	// we have already added 516kb of memory to the program [512 for chunk size
+	// and 4kb for the buffer] and lost the benefits of streaming. Just 10 concurrent
+	// requests and we are already at 5mb of memory.
+	//
+	// Meanwhile we already have io.Copy with its buffer that streams 32kb chunks from the file to the connection.
+	reader := io.LimitReader(file, chunkSize)
+	
+	// Check if we should compress this chunk.
+	// We only want to compress when it is beneficial
+	acceptsGzip := strings.Contains(r.Header.Get("Accept-Encoding"), "gzip")
+	shouldCompress := acceptsGzip &&
+		isCompressibleType(contentType) &&
+		chunkSize >= MinCompressionSize // Only compress chunks >= 8KB
 
 	if shouldCompress {
 		// For compressed chunks
@@ -152,7 +184,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		defer gz.Close()
 
 		// Send compressed chunk
-		_, err = io.Copy(gz, chunkReader)
+		_, err = io.Copy(gz, reader)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -166,7 +198,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusPartialContent)
 
 	// Send uncompressed chunk
-	_, err = io.Copy(w, chunkReader)
+	_, err = io.Copy(w, reader)
 	if err != nil {
 		log.Printf("Error sending chunk: %v", err)
 		return

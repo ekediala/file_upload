@@ -45,6 +45,10 @@ func main() {
 
 	fmt.Println("Started server on port:", Port)
 
+	// start the server in a goroutine. We could just start the server on the main
+	// thread but that introduces problems for our clean up process. If we listen to
+	// the clean up in a goroutine we won't be able to wait for the shutdown process
+	// to finish before exiting main.
 	go func() {
 		err := server.ListenAndServe()
 		if errors.Is(err, http.ErrServerClosed) {
@@ -123,15 +127,22 @@ func FileDownloadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// set file offset to last offset we wrote to, this is where
+	// we do resumability
 	_, err = file.Seek(fileSize, io.SeekStart)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
+	// create a 64kb buffer to stream the response to the file
+	// why? we want to minimize the amount of system calls we make
+	// we want to hit the sweet spot between memory consumption 
+	// and cpu usage.
 	writer := bufio.NewWriterSize(file, bufferSize)
 	defer writer.Flush()
 
+	// we make http requests to get each chunk of data
 	for start := fileSize; start < totalSize; start += chunkSize {
 		end := start + chunkSize - 1
 		if end > totalSize {
@@ -164,8 +175,20 @@ func downloadChunk(ctx context.Context, client *http.Client, w io.Writer, url st
 	}
 	defer res.Body.Close()
 
+	if res.StatusCode >= http.StatusBadRequest {
+		var b bytes.Buffer
+		_, err := io.Copy(&b, res.Body)
+		if err != nil {
+			return http.StatusInternalServerError, err
+		}
+
+		return res.StatusCode, fmt.Errorf(b.String())
+	}
+
 	var reader io.Reader = res.Body
 
+	// check if the data is compressed and use a gzip reader
+	// to read it.
 	if res.Header.Get("Content-Encoding") == "gzip" {
 		gzipReader, err := gzip.NewReader(res.Body)
 		if err != nil {
@@ -175,16 +198,17 @@ func downloadChunk(ctx context.Context, client *http.Client, w io.Writer, url st
 		reader = gzipReader
 	}
 
-	if res.StatusCode >= http.StatusBadRequest {
-		var b bytes.Buffer
-		_, err := io.Copy(&b, reader)
-		if err != nil {
-			return http.StatusInternalServerError, err
-		}
-
-		return res.StatusCode, fmt.Errorf(b.String())
-	}
-
+	// stream the response in 32kb chunks to the buffer which then
+	// writes the data to the file in 64kb chunks.
+	// this cuts our cpu usage in half but also increases our memory usage
+	// for the handler by 64kb.
+	// 
+	// TODO: rethink this. might just be better to write directly to the file
+	// cpu vs memory usage. Decisions decisions. Tradeoff tradeoffs.
+	// 
+	// EDIT: Our AI overlords (Gemini 2.5 Pro and Claude 3.7 Sonnet) both suggest
+	// we should keep the buffer. It is between microservices, we do not expect to 
+	// be handling thousands of concurrent downloads.
 	_, err = io.Copy(w, reader)
 	if err != nil {
 		return http.StatusInternalServerError, err
